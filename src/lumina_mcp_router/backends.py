@@ -1,13 +1,14 @@
-"""MCP client wrappers for backend servers (SSE transport)."""
+"""MCP client wrappers for backend servers (SSE + streamablehttp transports)."""
 from __future__ import annotations
 
 import logging
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, AsyncIterator
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 from .config import BackendConfig
 
@@ -22,11 +23,31 @@ class BackendTool:
     input_schema: dict[str, Any]
 
 
+@asynccontextmanager
+async def _open_transport(transport: str, url: str) -> AsyncIterator[tuple[Any, Any]]:
+    """Open the correct MCP client transport and yield (read, write) streams.
+
+    Both transports expose a ``(read, write)`` pair compatible with
+    ``ClientSession``. ``streamablehttp_client`` additionally yields a third
+    element (a ``get_session_id`` callback) which we simply ignore here.
+    """
+    if transport == "sse":
+        async with sse_client(url) as streams:
+            yield streams[0], streams[1]
+    elif transport == "streamablehttp":
+        async with streamablehttp_client(url) as streams:
+            # streams = (read, write, get_session_id)
+            yield streams[0], streams[1]
+    else:  # pragma: no cover - guarded by config validation
+        raise ValueError(f"unsupported transport: {transport!r}")
+
+
 class BackendConnection:
-    """Persistent MCP SSE connection to one backend.
+    """Persistent MCP connection to one backend.
 
     The connection is kept open for the router's lifetime so tool calls
-    can be forwarded with low latency.
+    can be forwarded with low latency. Transport is selected per-backend
+    (``sse`` or ``streamablehttp``).
     """
 
     def __init__(self, cfg: BackendConfig) -> None:
@@ -44,13 +65,22 @@ class BackendConnection:
             return
         stack = AsyncExitStack()
         try:
-            read, write = await stack.enter_async_context(sse_client(self.cfg.url))
+            read, write = await stack.enter_async_context(
+                _open_transport(self.cfg.transport, self.cfg.url)
+            )
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             self.session = session
             self._stack = stack
             self._connected = True
-            logger.info("backend_connected", extra={"backend": self.cfg.name, "url": self.cfg.url})
+            logger.info(
+                "backend_connected",
+                extra={
+                    "backend": self.cfg.name,
+                    "url": self.cfg.url,
+                    "transport": self.cfg.transport,
+                },
+            )
         except Exception:
             await stack.aclose()
             raise

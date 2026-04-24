@@ -52,15 +52,27 @@ Example `backends.yaml`:
 
 ```yaml
 backends:
-  - name: gsuite
-    url: http://localhost:30203/sse
   - name: microsoft
+    transport: sse              # optional, default: sse
     url: http://localhost:30201/sse
-  - name: odoo
-    url: http://localhost:30202/sse
   - name: hass
+    transport: sse
     url: http://localhost:30205/sse
+  - name: gsuite
+    transport: streamablehttp   # HTTP + JSON streaming (MCP "Streamable HTTP")
+    url: http://localhost:30203/mcp
+  - name: odoo
+    transport: streamablehttp
+    url: http://localhost:30202/mcp
 ```
+
+Each backend entry accepts:
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `name` | yes | — | Unique backend identifier, used as tool-name prefix (`<name>__<tool>`) |
+| `url` | yes | — | Full URL to the backend MCP endpoint (path included) |
+| `transport` | no | `sse` | Transport to use: `sse` or `streamablehttp` |
 
 ## Configuration
 

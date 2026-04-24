@@ -4,14 +4,20 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import yaml
+
+
+Transport = Literal["sse", "streamablehttp"]
+VALID_TRANSPORTS: tuple[Transport, ...] = ("sse", "streamablehttp")
 
 
 @dataclass(frozen=True)
 class BackendConfig:
     name: str
     url: str
+    transport: Transport = "sse"
 
 
 @dataclass
@@ -46,7 +52,19 @@ class Config:
         raw = yaml.safe_load(path.read_text()) or {}
         out: list[BackendConfig] = []
         for b in raw.get("backends", []):
-            out.append(BackendConfig(name=b["name"], url=b["url"]))
+            transport = (b.get("transport") or "sse").lower()
+            if transport not in VALID_TRANSPORTS:
+                raise ValueError(
+                    f"backend {b.get('name')!r}: invalid transport "
+                    f"{transport!r}, must be one of {VALID_TRANSPORTS}"
+                )
+            out.append(
+                BackendConfig(
+                    name=b["name"],
+                    url=b["url"],
+                    transport=transport,  # type: ignore[arg-type]
+                )
+            )
         self.backends = out
         return out
 
