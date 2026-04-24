@@ -94,9 +94,29 @@ CALL_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
-def build_indexed_text(backend: str, tool_name: str, description: str) -> str:
-    """Canonical form used for embedding a tool."""
-    return f"[{backend}] {tool_name}: {description}"
+def build_indexed_text(
+    backend: str,
+    tool_name: str,
+    description: str,
+    embedding_context: str | None = None,
+) -> str:
+    """Canonical form used for embedding a tool.
+
+    When ``embedding_context`` is provided it is prepended verbatim to give the
+    embedding model a strong descriptive signal about the backend service
+    (e.g. "Microsoft 365 Outlook (Exchange, ...)"). This helps the semantic
+    search distinguish tools with similar surface vocabulary across backends
+    (Gmail vs Outlook, Google Drive vs OneDrive, ...).
+
+    The tool name is "humanised" (``snake_case`` -> space-separated words)
+    so individual tokens contribute to the embedding without being drowned
+    inside a single compound identifier.
+
+    Falls back to the current backend name when no context is configured.
+    """
+    ctx = embedding_context or backend
+    human_name = tool_name.replace("_", " ")
+    return f"{ctx}. Tool: {human_name}. {description}"
 
 
 def qualified_name(backend: str, tool_name: str) -> str:
@@ -137,8 +157,9 @@ class Router:
                 stats["backends"][name] = {"status": "error", "error": str(e), "tools": 0}
                 continue
             count = 0
+            ctx = getattr(conn.cfg, "embedding_context", None) if hasattr(conn, "cfg") else None
             for t in tools:
-                text = build_indexed_text(t.backend, t.name, t.description)
+                text = build_indexed_text(t.backend, t.name, t.description, ctx)
                 try:
                     vec = await self.embedder.embed(text)
                 except Exception as e:

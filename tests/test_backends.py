@@ -125,6 +125,33 @@ async def test_open_transport_rejects_unknown() -> None:
 def test_backend_config_default_transport() -> None:
     b = BackendConfig(name="x", url="http://x/sse")
     assert b.transport == "sse"
+    assert b.embedding_context is None
+
+
+def test_load_backends_parses_embedding_context(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "backends.yaml"
+    cfg_path.write_text(
+        """
+backends:
+  - name: gsuite
+    transport: streamablehttp
+    url: http://g/mcp
+    embedding_context: "Google Workspace (Gmail, Drive)"
+  - name: microsoft
+    transport: sse
+    url: http://m/sse
+    embedding_context: "Microsoft 365 Outlook (Exchange)"
+  - name: plain
+    url: http://p/sse
+"""
+    )
+    cfg = Config(backends_config_path=str(cfg_path))
+    backends = cfg.load_backends()
+    by_name = {b.name: b for b in backends}
+    assert by_name["gsuite"].embedding_context == "Google Workspace (Gmail, Drive)"
+    assert by_name["microsoft"].embedding_context == "Microsoft 365 Outlook (Exchange)"
+    # Absent field → None (fallback handled by build_indexed_text).
+    assert by_name["plain"].embedding_context is None
 
 
 # ---------------------------------------------------------------------------

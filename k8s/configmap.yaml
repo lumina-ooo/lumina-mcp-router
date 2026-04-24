@@ -9,12 +9,16 @@ data:
       - name: microsoft
         transport: sse
         url: http://mcp-microsoft.mcp-server.svc.cluster.local/sse
+        embedding_context: "Microsoft 365 Outlook (Exchange, professional business email, Office 365, OneDrive, Teams, SharePoint, @sourse.eu professional email, @*.onmicrosoft.com accounts)"
       - name: hass
         transport: sse
         url: http://mcp-hass.mcp-server.svc.cluster.local/sse
+        embedding_context: "Home Assistant (smart home, IoT devices, lights, switches, sensors, temperature, climate, automation, scenes)"
       - name: gsuite
         transport: streamablehttp
         url: http://mcp-gsuite.mcp-server.svc.cluster.local/mcp
+        embedding_context: "Google Workspace (Gmail, Google Drive, Google Calendar, Google Docs, Google Sheets, Google Forms, personal @gmail.com accounts)"
       - name: odoo
         transport: streamablehttp
         url: http://mcp-odoo.mcp-server.svc.cluster.local/mcp
+        embedding_context: "Odoo ERP (CRM, sales, invoicing, accounting, inventory, partners, customers, products, opportunities, leads)"

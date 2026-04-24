@@ -18,6 +18,10 @@ class BackendConfig:
     name: str
     url: str
     transport: Transport = "sse"
+    # Optional human-readable descriptive context about the backend, prepended
+    # to each tool's embedded text to sharpen semantic search (e.g.
+    # differentiate Gmail vs Outlook). See ``tools.build_indexed_text``.
+    embedding_context: str | None = None
 
 
 @dataclass
@@ -63,6 +67,7 @@ class Config:
                     name=b["name"],
                     url=b["url"],
                     transport=transport,  # type: ignore[arg-type]
+                    embedding_context=(b.get("embedding_context") or None),
                 )
             )
         self.backends = out

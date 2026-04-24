@@ -5,7 +5,7 @@ import pytest
 
 from lumina_mcp_router.backends import BackendTool
 from lumina_mcp_router.index import VectorIndex
-from lumina_mcp_router.tools import Router, qualified_name
+from lumina_mcp_router.tools import Router, build_indexed_text, qualified_name
 
 
 class FakeEmbedder:
@@ -165,3 +165,40 @@ async def test_top_k_is_clamped(router):
     out = await router.search_tools(query="anything", top_k=999)
     # max 25, but we only have 3 tools
     assert len(out["results"]) <= 25
+
+
+# ---------------------------------------------------------------------------
+# build_indexed_text
+# ---------------------------------------------------------------------------
+
+def test_build_indexed_text_fallback_to_backend_name() -> None:
+    text = build_indexed_text(
+        backend="gsuite",
+        tool_name="send_gmail_message",
+        description="Send an email via Gmail.",
+    )
+    # No embedding_context → backend name is used as the context prefix.
+    assert text.startswith("gsuite. ")
+    # snake_case is humanised.
+    assert "Tool: send gmail message." in text
+    assert text.endswith("Send an email via Gmail.")
+
+
+def test_build_indexed_text_uses_embedding_context() -> None:
+    ctx = "Microsoft 365 Outlook (Exchange, professional business email)"
+    text = build_indexed_text(
+        backend="microsoft",
+        tool_name="search_emails",
+        description="Search emails in the user's Outlook mailbox.",
+        embedding_context=ctx,
+    )
+    assert text.startswith(ctx + ". ")
+    assert "Tool: search emails." in text
+    assert "Outlook mailbox" in text
+    # Discriminant tokens appear multiple times → stronger embedding signal.
+    assert text.count("Outlook") >= 2
+
+
+def test_build_indexed_text_empty_context_falls_back() -> None:
+    text = build_indexed_text("hass", "toggle_light", "Toggle a light.", "")
+    assert text.startswith("hass. ")
