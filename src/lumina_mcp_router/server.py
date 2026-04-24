@@ -126,10 +126,19 @@ def build_app(cfg: Config, router: Router, mcp_server: Server) -> Starlette:
 
     @admin.get("/health")
     async def health() -> dict[str, Any]:
+        backends = []
+        for name in router.registry.names():
+            conn = router.registry.get(name)
+            backends.append(
+                {
+                    "name": name,
+                    "connected": bool(conn and conn.is_connected),
+                }
+            )
         return {
             "status": "ok",
             "tools_indexed": len(router.index),
-            "backends": router.registry.names(),
+            "backends": backends,
         }
 
     @admin.get("/tools")

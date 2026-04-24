@@ -1,6 +1,14 @@
-"""MCP client wrappers for backend servers (SSE + streamablehttp transports)."""
+"""MCP client wrappers for backend servers (SSE + streamablehttp transports).
+
+Each backend connection runs inside its own dedicated asyncio task so that
+the ``AsyncExitStack`` owning the transport is opened and closed from the
+same task. This avoids the ``anyio`` cancel-scope cross-task errors that
+would otherwise crash the router lifespan when a single backend fails to
+connect or is shut down.
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -11,8 +19,18 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from .config import BackendConfig
+from .http import build_host_override_client_factory
 
 logger = logging.getLogger(__name__)
+
+
+# Shared factory: all outgoing backend requests get ``Host: localhost``.
+_HTTPX_FACTORY = build_host_override_client_factory()
+
+# Default timeout for establishing a backend connection (initialize + tools).
+DEFAULT_CONNECT_TIMEOUT = 15.0
+# Default timeout for gracefully shutting down a backend task.
+DEFAULT_CLOSE_TIMEOUT = 5.0
 
 
 @dataclass
@@ -30,12 +48,17 @@ async def _open_transport(transport: str, url: str) -> AsyncIterator[tuple[Any, 
     Both transports expose a ``(read, write)`` pair compatible with
     ``ClientSession``. ``streamablehttp_client`` additionally yields a third
     element (a ``get_session_id`` callback) which we simply ignore here.
+
+    The shared ``httpx_client_factory`` is injected so every outgoing HTTP
+    request carries the overridden ``Host`` header (see :mod:`.http`).
     """
     if transport == "sse":
-        async with sse_client(url) as streams:
+        async with sse_client(url, httpx_client_factory=_HTTPX_FACTORY) as streams:
             yield streams[0], streams[1]
     elif transport == "streamablehttp":
-        async with streamablehttp_client(url) as streams:
+        async with streamablehttp_client(
+            url, httpx_client_factory=_HTTPX_FACTORY
+        ) as streams:
             # streams = (read, write, get_session_id)
             yield streams[0], streams[1]
     else:  # pragma: no cover - guarded by config validation
@@ -45,55 +68,143 @@ async def _open_transport(transport: str, url: str) -> AsyncIterator[tuple[Any, 
 class BackendConnection:
     """Persistent MCP connection to one backend.
 
-    The connection is kept open for the router's lifetime so tool calls
-    can be forwarded with low latency. Transport is selected per-backend
-    (``sse`` or ``streamablehttp``).
+    The connection lives inside a dedicated asyncio task so that opening and
+    closing the transport happens in the same task (required by ``anyio``).
+    Tool calls are forwarded via the shared :class:`ClientSession`, which is
+    thread-safe enough for the router's use case (serialised over the
+    underlying read/write memory streams).
     """
 
     def __init__(self, cfg: BackendConfig) -> None:
         self.cfg = cfg
-        self._stack: AsyncExitStack | None = None
         self.session: ClientSession | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._ready: asyncio.Event | None = None
+        self._stop: asyncio.Event | None = None
+        self._error: BaseException | None = None
         self._connected = False
 
     @property
     def name(self) -> str:
         return self.cfg.name
 
-    async def connect(self) -> None:
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self.session is not None
+
+    async def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
+        """Start the backend task and wait until it's initialised.
+
+        Raises whatever exception the worker task captured if the transport
+        or ``initialize()`` call failed.
+        """
         if self._connected:
             return
-        stack = AsyncExitStack()
-        try:
-            read, write = await stack.enter_async_context(
-                _open_transport(self.cfg.transport, self.cfg.url)
-            )
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            self.session = session
-            self._stack = stack
-            self._connected = True
-            logger.info(
-                "backend_connected",
-                extra={
-                    "backend": self.cfg.name,
-                    "url": self.cfg.url,
-                    "transport": self.cfg.transport,
-                },
-            )
-        except Exception:
-            await stack.aclose()
-            raise
-
-    async def close(self) -> None:
-        if self._stack is not None:
-            try:
-                await self._stack.aclose()
-            except Exception as e:  # pragma: no cover - shutdown best effort
-                logger.warning("backend_close_error: %s", e)
-        self._stack = None
+        # Reset any stale state from a previous failed attempt.
         self.session = None
-        self._connected = False
+        self._error = None
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+
+        ready = self._ready
+        stop = self._stop
+
+        async def _runner() -> None:
+            stack = AsyncExitStack()
+            try:
+                read, write = await stack.enter_async_context(
+                    _open_transport(self.cfg.transport, self.cfg.url)
+                )
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+                self.session = session
+                self._connected = True
+                ready.set()
+                # Keep the transport + session alive until close() is called.
+                await stop.wait()
+            except BaseException as e:  # noqa: BLE001 - propagated via self._error
+                self._error = e
+                # Make sure connect() wakes up even if we failed before ready.
+                if not ready.is_set():
+                    ready.set()
+            finally:
+                self._connected = False
+                self.session = None
+                try:
+                    await stack.aclose()
+                except BaseException as e:  # pragma: no cover - best effort
+                    logger.warning(
+                        "backend_stack_close_error",
+                        extra={"backend": self.cfg.name, "error": str(e)},
+                    )
+
+        self._task = asyncio.create_task(
+            _runner(), name=f"lumina-backend-{self.cfg.name}"
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # Tell the worker to bail out and wait for it to finish cleanly.
+            stop.set()
+            await self._await_task_silent()
+            self._task = None
+            raise TimeoutError(
+                f"backend {self.cfg.name!r} connect timed out after {timeout}s"
+            )
+
+        if self._error is not None:
+            # Worker captured an exception; propagate it (stack already closed).
+            await self._await_task_silent()
+            self._task = None
+            err = self._error
+            self._error = None
+            raise RuntimeError(
+                f"backend {self.cfg.name!r} failed to connect: {err}"
+            ) from err
+
+        logger.info(
+            "backend_connected",
+            extra={
+                "backend": self.cfg.name,
+                "url": self.cfg.url,
+                "transport": self.cfg.transport,
+            },
+        )
+
+    async def close(self, timeout: float = DEFAULT_CLOSE_TIMEOUT) -> None:
+        if self._task is None:
+            self._connected = False
+            self.session = None
+            return
+        if self._stop is not None:
+            self._stop.set()
+        try:
+            await asyncio.wait_for(self._task, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "backend_close_timeout", extra={"backend": self.cfg.name}
+            )
+            self._task.cancel()
+            await self._await_task_silent()
+        except BaseException as e:  # pragma: no cover - shutdown best effort
+            logger.warning(
+                "backend_close_error",
+                extra={"backend": self.cfg.name, "error": str(e)},
+            )
+        finally:
+            self._task = None
+            self._stop = None
+            self._ready = None
+            self.session = None
+            self._connected = False
+
+    async def _await_task_silent(self) -> None:
+        if self._task is None:
+            return
+        try:
+            await self._task
+        except BaseException:  # noqa: BLE001 - already captured in self._error
+            pass
 
     async def list_tools(self) -> list[BackendTool]:
         if not self.session:
@@ -121,7 +232,11 @@ class BackendConnection:
 
 
 class BackendRegistry:
-    """Manages connections to all configured backends."""
+    """Manages connections to all configured backends.
+
+    ``connect_all`` is resilient: one backend failing to connect never
+    prevents the other backends (or the router itself) from starting.
+    """
 
     def __init__(self, backends: list[BackendConfig]) -> None:
         self._by_name: dict[str, BackendConnection] = {
@@ -135,20 +250,45 @@ class BackendRegistry:
         return self._by_name.get(name)
 
     async def connect_all(self) -> dict[str, bool]:
-        """Connect to all backends; log WARNING on failures, return status map."""
+        """Connect to all backends; log WARNING on failures, return status map.
+
+        Failures are fully contained: ``BaseException`` (including
+        ``BaseExceptionGroup`` raised by anyio task groups on transport
+        errors) is caught per-backend so a single bad backend cannot crash
+        the router lifespan.
+        """
         status: dict[str, bool] = {}
         for name, conn in self._by_name.items():
+            if conn.is_connected:
+                status[name] = True
+                continue
             try:
                 await conn.connect()
                 status[name] = True
-            except Exception as e:
+            except BaseException as e:  # noqa: BLE001 - see docstring
                 logger.warning(
                     "backend_connect_failed",
-                    extra={"backend": name, "error": str(e)},
+                    extra={
+                        "backend": name,
+                        "url": conn.cfg.url,
+                        "transport": conn.cfg.transport,
+                        "error": str(e) or type(e).__name__,
+                    },
                 )
+                # Ensure any half-started task is torn down.
+                try:
+                    await conn.close()
+                except BaseException:  # pragma: no cover - best effort
+                    pass
                 status[name] = False
         return status
 
     async def close_all(self) -> None:
         for conn in self._by_name.values():
-            await conn.close()
+            try:
+                await conn.close()
+            except BaseException as e:  # pragma: no cover - shutdown best effort
+                logger.warning(
+                    "backend_close_error",
+                    extra={"backend": conn.name, "error": str(e)},
+                )
