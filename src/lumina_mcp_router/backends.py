@@ -47,6 +47,14 @@ TRANSIENT_ERROR_PATTERNS: tuple[str, ...] = (
     "connection reset",
     "stream closed",
     "broken pipe",
+    # Backend pod restart invalidates the streamable-http session; the SDK /
+    # httpx surface these phrasings when subsequent POSTs to /mcp 404 out.
+    "session terminated",
+    "session not found",
+    "404 not found",
+    "missing session id",
+    "mcp-session-id",
+    "http 404",
 )
 
 

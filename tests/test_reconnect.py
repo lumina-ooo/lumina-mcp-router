@@ -123,6 +123,12 @@ def test_transient_patterns_cover_required_phrases() -> None:
         "connection reset",
         "stream closed",
         "broken pipe",
+        "session terminated",
+        "session not found",
+        "404 not found",
+        "missing session id",
+        "mcp-session-id",
+        "http 404",
     }
     assert required.issubset(set(TRANSIENT_ERROR_PATTERNS))
 
@@ -358,3 +364,80 @@ async def test_call_tool_does_not_retry_is_error_with_non_transient_text(
     assert result is non_transient
     assert reconnects == []
     assert len(failing.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# (h) Exception("Session terminated") → reconnect + retry succeeds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_on_session_terminated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _make_conn()
+    failing = _FakeSession([RuntimeError("Session terminated")])
+    healed = _FakeSession([{"ok": True}])
+    conn.session = failing  # type: ignore[assignment]
+    conn._connected = True
+
+    reconnects: list[int] = []
+    _install_fake_lifecycle(monkeypatch, conn, [healed], reconnect_counter=reconnects)
+
+    result = await conn.call_tool("odoo_search", {})
+    assert result == {"ok": True}
+    assert len(reconnects) == 1
+    assert len(failing.calls) == 1
+    assert len(healed.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# (i) Exception("HTTP 404 Not Found") → reconnect + retry succeeds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_on_http_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _make_conn()
+    failing = _FakeSession([RuntimeError("HTTP 404 Not Found")])
+    healed = _FakeSession([{"ok": True}])
+    conn.session = failing  # type: ignore[assignment]
+    conn._connected = True
+
+    reconnects: list[int] = []
+    _install_fake_lifecycle(monkeypatch, conn, [healed], reconnect_counter=reconnects)
+
+    result = await conn.call_tool("odoo_search", {})
+    assert result == {"ok": True}
+    assert len(reconnects) == 1
+    assert len(failing.calls) == 1
+    assert len(healed.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# (j) CallToolResult(isError=True, "Session not found") → reconnect + retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_on_is_error_session_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _make_conn()
+    transient_result = _make_tool_result(True, "Session not found")
+    success_result = _make_tool_result(False, "ok!")
+    failing = _FakeSession([transient_result])
+    healed = _FakeSession([success_result])
+    conn.session = failing  # type: ignore[assignment]
+    conn._connected = True
+
+    reconnects: list[int] = []
+    _install_fake_lifecycle(monkeypatch, conn, [healed], reconnect_counter=reconnects)
+
+    result = await conn.call_tool("odoo_search", {})
+    assert result is success_result
+    assert len(reconnects) == 1
+    assert len(failing.calls) == 1
+    assert len(healed.calls) == 1
