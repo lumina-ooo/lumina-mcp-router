@@ -33,6 +33,38 @@ DEFAULT_CONNECT_TIMEOUT = 15.0
 DEFAULT_CLOSE_TIMEOUT = 5.0
 
 
+# Case-insensitive substrings that indicate a backend session has been torn
+# down / expired and a reconnect + retry is worth attempting once. Extend
+# this list when we discover additional transient failure modes (e.g. new
+# upstream servers using different phrasings).
+TRANSIENT_ERROR_PATTERNS: tuple[str, ...] = (
+    "not authenticated",
+    "authentication required",
+    "session expired",
+    "session closed",
+    "connection closed",
+    "closedresourceerror",
+    "connection reset",
+    "stream closed",
+    "broken pipe",
+)
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` looks like a recoverable session/auth failure.
+
+    Matches against the exception's string representation **and** its class
+    name (so e.g. ``anyio.ClosedResourceError`` is caught by type name even
+    if its ``str()`` is empty).
+    """
+    msg = str(exc).lower()
+    type_name = type(exc).__name__.lower()
+    for pat in TRANSIENT_ERROR_PATTERNS:
+        if pat in msg or pat in type_name:
+            return True
+    return False
+
+
 @dataclass
 class BackendTool:
     backend: str
@@ -83,6 +115,13 @@ class BackendConnection:
         self._stop: asyncio.Event | None = None
         self._error: BaseException | None = None
         self._connected = False
+        # Serialises reconnect attempts so two concurrent failing tool calls
+        # don't both tear down and rebuild the session.
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
+        # Monotonic counter bumped on every successful reconnect. Concurrent
+        # callers capture it before acquiring the lock; if it changed while
+        # they waited, another task already reconnected and they can skip.
+        self._reconnect_generation: int = 0
 
     @property
     def name(self) -> str:
@@ -226,9 +265,126 @@ class BackendConnection:
         return out
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Invoke a tool on the backend, reconnecting once on transient errors.
+
+        If the underlying ``ClientSession`` call fails with an error matching
+        :data:`TRANSIENT_ERROR_PATTERNS` (e.g. the backend tore down the
+        session and lost its auth state), we transparently reconnect the
+        backend **once** and retry the call. A second failure — transient or
+        not — is surfaced to the caller. The reconnect is guarded by a
+        per-backend :class:`asyncio.Lock` so concurrent failing callers don't
+        trigger multiple simultaneous reconnects.
+        """
+        if not self.session:
+            # Session is missing — try to (re)connect before the first call.
+            await self._reconnect_locked(
+                reason="no active session",
+                observed_generation=self._reconnect_generation,
+            )
         if not self.session:
             raise RuntimeError(f"backend {self.cfg.name} not connected")
-        return await self.session.call_tool(name, arguments or {})
+
+        args = arguments or {}
+        # Capture the reconnect generation BEFORE the call: if the call fails
+        # with a transient error and we enter _reconnect_locked, concurrent
+        # waiters that saw the same generation know a single reconnect covers
+        # them all.
+        gen_before = self._reconnect_generation
+        try:
+            return await self.session.call_tool(name, args)
+        except BaseException as first_exc:  # noqa: BLE001 - classified below
+            if not _is_transient_error(first_exc):
+                raise
+            logger.warning(
+                "backend_call_transient_error",
+                extra={
+                    "backend": self.cfg.name,
+                    "tool": name,
+                    "error": str(first_exc) or type(first_exc).__name__,
+                    "phase": "initial",
+                },
+            )
+            try:
+                await self._reconnect_locked(
+                    reason=f"transient error: {first_exc}",
+                    observed_generation=gen_before,
+                )
+            except BaseException as reconnect_exc:  # noqa: BLE001
+                logger.error(
+                    "backend_reconnect_failed",
+                    extra={
+                        "backend": self.cfg.name,
+                        "error": str(reconnect_exc)
+                        or type(reconnect_exc).__name__,
+                    },
+                )
+                # Surface the *original* error so the caller sees the real cause.
+                raise first_exc
+
+            if not self.session:
+                # Reconnect reported success but session is still missing.
+                raise first_exc
+
+            try:
+                result = await self.session.call_tool(name, args)
+            except BaseException as retry_exc:  # noqa: BLE001
+                logger.error(
+                    "backend_call_retry_failed",
+                    extra={
+                        "backend": self.cfg.name,
+                        "tool": name,
+                        "error": str(retry_exc) or type(retry_exc).__name__,
+                        "phase": "retry",
+                    },
+                )
+                # Do NOT loop; surface the original error upward.
+                raise first_exc
+            logger.info(
+                "backend_call_retry_succeeded",
+                extra={"backend": self.cfg.name, "tool": name},
+            )
+            return result
+
+    async def _reconnect_locked(
+        self, reason: str, observed_generation: int | None = None
+    ) -> None:
+        """Tear down the existing session and re-establish it, under a lock.
+
+        Concurrent callers wait for the first reconnect to finish; when the
+        lock is released we compare the reconnect generation they observed
+        before the failed call with the current one — if it changed, another
+        task already reconnected on their behalf and we skip the rebuild.
+        """
+        async with self._reconnect_lock:
+            if (
+                observed_generation is not None
+                and observed_generation != self._reconnect_generation
+                and self.is_connected
+                and self.session is not None
+            ):
+                logger.debug(
+                    "backend_reconnect_skipped",
+                    extra={"backend": self.cfg.name, "reason": reason},
+                )
+                return
+            logger.info(
+                "backend_reconnecting",
+                extra={
+                    "backend": self.cfg.name,
+                    "url": self.cfg.url,
+                    "transport": self.cfg.transport,
+                    "reason": reason,
+                },
+            )
+            try:
+                await self.close()
+            except BaseException as e:  # pragma: no cover - best effort teardown
+                logger.warning(
+                    "backend_reconnect_close_error",
+                    extra={"backend": self.cfg.name, "error": str(e)},
+                )
+            await self.connect()
+            self._reconnect_generation += 1
 
 
 class BackendRegistry:
