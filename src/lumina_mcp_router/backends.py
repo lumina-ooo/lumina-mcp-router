@@ -50,6 +50,15 @@ TRANSIENT_ERROR_PATTERNS: tuple[str, ...] = (
 )
 
 
+def _matches_transient_pattern(text: str) -> bool:
+    """Return True if ``text`` (already stringified) matches any transient pattern."""
+    lowered = text.lower()
+    for pat in TRANSIENT_ERROR_PATTERNS:
+        if pat in lowered:
+            return True
+    return False
+
+
 def _is_transient_error(exc: BaseException) -> bool:
     """Return True if ``exc`` looks like a recoverable session/auth failure.
 
@@ -57,10 +66,29 @@ def _is_transient_error(exc: BaseException) -> bool:
     name (so e.g. ``anyio.ClosedResourceError`` is caught by type name even
     if its ``str()`` is empty).
     """
-    msg = str(exc).lower()
-    type_name = type(exc).__name__.lower()
-    for pat in TRANSIENT_ERROR_PATTERNS:
-        if pat in msg or pat in type_name:
+    if _matches_transient_pattern(str(exc)):
+        return True
+    if _matches_transient_pattern(type(exc).__name__):
+        return True
+    return False
+
+
+def _result_has_transient_error(result: Any) -> bool:
+    """Return True if ``result`` is a CallToolResult whose ``isError`` is truthy
+    AND whose text content matches one of :data:`TRANSIENT_ERROR_PATTERNS`.
+
+    An MCP ``CallToolResult`` exposes ``isError: bool`` and ``content: list``
+    of content blocks; ``TextContent`` blocks carry a ``.text`` attribute.
+    A backend can return HTTP 200 with such a result to signal a tool-level
+    failure (e.g. "Not authenticated with Odoo") that is nevertheless
+    transient and worth a reconnect + retry.
+    """
+    if not getattr(result, "isError", False):
+        return False
+    content = getattr(result, "content", None) or []
+    for block in content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and _matches_transient_pattern(text):
             return True
     return False
 
@@ -267,13 +295,21 @@ class BackendConnection:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Invoke a tool on the backend, reconnecting once on transient errors.
 
-        If the underlying ``ClientSession`` call fails with an error matching
-        :data:`TRANSIENT_ERROR_PATTERNS` (e.g. the backend tore down the
-        session and lost its auth state), we transparently reconnect the
-        backend **once** and retry the call. A second failure — transient or
-        not — is surfaced to the caller. The reconnect is guarded by a
-        per-backend :class:`asyncio.Lock` so concurrent failing callers don't
-        trigger multiple simultaneous reconnects.
+        Two classes of transient failure are handled identically:
+
+        * A Python exception raised by ``ClientSession.call_tool`` whose
+          message/type matches :data:`TRANSIENT_ERROR_PATTERNS`.
+        * A successful-looking ``CallToolResult`` with ``isError=True`` whose
+          text content matches the same patterns — this is how real MCP
+          servers (e.g. Odoo) report "Not authenticated" at HTTP 200.
+
+        In either case we transparently reconnect the backend **once** and
+        retry the call. A second failure — transient or not — is surfaced to
+        the caller: for retried transient results we return the *original*
+        result so the caller sees the real error rather than a stale second
+        copy. The reconnect is guarded by a per-backend :class:`asyncio.Lock`
+        so concurrent failing callers don't trigger multiple simultaneous
+        reconnects.
         """
         if not self.session:
             # Session is missing — try to (re)connect before the first call.
@@ -290,11 +326,23 @@ class BackendConnection:
         # waiters that saw the same generation know a single reconnect covers
         # them all.
         gen_before = self._reconnect_generation
+        first_exc: BaseException | None = None
+        first_result: Any = None
         try:
-            return await self.session.call_tool(name, args)
-        except BaseException as first_exc:  # noqa: BLE001 - classified below
-            if not _is_transient_error(first_exc):
+            first_result = await self.session.call_tool(name, args)
+        except BaseException as exc:  # noqa: BLE001 - classified below
+            if not _is_transient_error(exc):
                 raise
+            first_exc = exc
+
+        if first_exc is None and not _result_has_transient_error(first_result):
+            # Happy path: no exception and no transient-marked result.
+            return first_result
+
+        # Build a human-readable reason + a "surface-on-retry-failure" value
+        # that reflects whichever signal (exception vs. result) we observed.
+        if first_exc is not None:
+            reason = f"transient error: {first_exc}"
             logger.warning(
                 "backend_call_transient_error",
                 extra={
@@ -302,48 +350,84 @@ class BackendConnection:
                     "tool": name,
                     "error": str(first_exc) or type(first_exc).__name__,
                     "phase": "initial",
+                    "source": "exception",
                 },
             )
-            try:
-                await self._reconnect_locked(
-                    reason=f"transient error: {first_exc}",
-                    observed_generation=gen_before,
-                )
-            except BaseException as reconnect_exc:  # noqa: BLE001
-                logger.error(
-                    "backend_reconnect_failed",
-                    extra={
-                        "backend": self.cfg.name,
-                        "error": str(reconnect_exc)
-                        or type(reconnect_exc).__name__,
-                    },
-                )
-                # Surface the *original* error so the caller sees the real cause.
-                raise first_exc
-
-            if not self.session:
-                # Reconnect reported success but session is still missing.
-                raise first_exc
-
-            try:
-                result = await self.session.call_tool(name, args)
-            except BaseException as retry_exc:  # noqa: BLE001
-                logger.error(
-                    "backend_call_retry_failed",
-                    extra={
-                        "backend": self.cfg.name,
-                        "tool": name,
-                        "error": str(retry_exc) or type(retry_exc).__name__,
-                        "phase": "retry",
-                    },
-                )
-                # Do NOT loop; surface the original error upward.
-                raise first_exc
-            logger.info(
-                "backend_call_retry_succeeded",
-                extra={"backend": self.cfg.name, "tool": name},
+        else:
+            reason = "transient error in CallToolResult (isError=True)"
+            logger.warning(
+                "backend_call_transient_error",
+                extra={
+                    "backend": self.cfg.name,
+                    "tool": name,
+                    "phase": "initial",
+                    "source": "result",
+                },
             )
-            return result
+
+        try:
+            await self._reconnect_locked(
+                reason=reason,
+                observed_generation=gen_before,
+            )
+        except BaseException as reconnect_exc:  # noqa: BLE001
+            logger.error(
+                "backend_reconnect_failed",
+                extra={
+                    "backend": self.cfg.name,
+                    "error": str(reconnect_exc)
+                    or type(reconnect_exc).__name__,
+                },
+            )
+            # Surface the *original* signal so the caller sees the real cause.
+            if first_exc is not None:
+                raise first_exc
+            return first_result
+
+        if not self.session:
+            # Reconnect reported success but session is still missing.
+            if first_exc is not None:
+                raise first_exc
+            return first_result
+
+        try:
+            retry_result = await self.session.call_tool(name, args)
+        except BaseException as retry_exc:  # noqa: BLE001
+            logger.error(
+                "backend_call_retry_failed",
+                extra={
+                    "backend": self.cfg.name,
+                    "tool": name,
+                    "error": str(retry_exc) or type(retry_exc).__name__,
+                    "phase": "retry",
+                },
+            )
+            # Do NOT loop; surface the original signal upward.
+            if first_exc is not None:
+                raise first_exc
+            return first_result
+
+        if _result_has_transient_error(retry_result):
+            logger.error(
+                "backend_call_retry_failed",
+                extra={
+                    "backend": self.cfg.name,
+                    "tool": name,
+                    "phase": "retry",
+                    "source": "result",
+                },
+            )
+            # Retry still transient — surface the ORIGINAL signal so the
+            # caller sees the real problem without an infinite retry loop.
+            if first_exc is not None:
+                raise first_exc
+            return first_result
+
+        logger.info(
+            "backend_call_retry_succeeded",
+            extra={"backend": self.cfg.name, "tool": name},
+        )
+        return retry_result
 
     async def _reconnect_locked(
         self, reason: str, observed_generation: int | None = None

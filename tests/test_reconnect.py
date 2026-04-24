@@ -11,7 +11,41 @@ from lumina_mcp_router.backends import (
     BackendConnection,
     TRANSIENT_ERROR_PATTERNS,
     _is_transient_error,
+    _result_has_transient_error,
 )
+
+try:  # Real MCP types if available so the assertions mirror production shapes.
+    from mcp.types import CallToolResult, TextContent  # type: ignore
+except Exception:  # pragma: no cover - fallback for minimal environments
+    CallToolResult = None  # type: ignore
+    TextContent = None  # type: ignore
+
+
+def _make_text_block(text: str):
+    if TextContent is not None:
+        return TextContent(type="text", text=text)
+
+    class _T:
+        pass
+
+    t = _T()
+    t.type = "text"
+    t.text = text
+    return t
+
+
+def _make_tool_result(is_error: bool, text: str):
+    block = _make_text_block(text)
+    if CallToolResult is not None:
+        return CallToolResult(content=[block], isError=is_error)
+
+    class _R:
+        pass
+
+    r = _R()
+    r.isError = is_error
+    r.content = [block]
+    return r
 from lumina_mcp_router.config import BackendConfig
 
 
@@ -227,3 +261,100 @@ async def test_concurrent_failures_only_trigger_one_reconnect(
     )
     assert {r["n"] for r in results} == {1, 2}
     assert len(reconnects) == 1
+
+
+# ---------------------------------------------------------------------------
+# (e) CallToolResult(isError=True, transient text) → reconnect + retry success
+# ---------------------------------------------------------------------------
+
+
+def test_result_has_transient_error_detects_odoo_auth_message() -> None:
+    err = _make_tool_result(True, "Not authenticated with Odoo. Use authenticate.")
+    assert _result_has_transient_error(err)
+
+    not_err = _make_tool_result(False, "Not authenticated with Odoo")
+    assert not _result_has_transient_error(not_err)
+
+    other = _make_tool_result(True, "Invalid partner ID")
+    assert not _result_has_transient_error(other)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_on_is_error_result_with_transient_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _make_conn()
+    transient_result = _make_tool_result(
+        True, "Not authenticated with Odoo. Use the authenticate tool first."
+    )
+    success_result = _make_tool_result(False, "ok!")
+    failing = _FakeSession([transient_result])
+    healed = _FakeSession([success_result])
+    conn.session = failing  # type: ignore[assignment]
+    conn._connected = True
+
+    reconnects: list[int] = []
+    _install_fake_lifecycle(monkeypatch, conn, [healed], reconnect_counter=reconnects)
+
+    result = await conn.call_tool("odoo_search", {"model": "res.partner"})
+    assert result is success_result
+    assert len(reconnects) == 1
+    assert failing.calls == [("odoo_search", {"model": "res.partner"})]
+    assert healed.calls == [("odoo_search", {"model": "res.partner"})]
+
+
+# ---------------------------------------------------------------------------
+# (f) Retry also returns transient CallToolResult → first result surfaces
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_returns_first_result_when_retry_result_also_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _make_conn()
+    first = _make_tool_result(True, "Not authenticated with Odoo (first)")
+    second = _make_tool_result(True, "Not authenticated with Odoo (second)")
+    failing = _FakeSession([first])
+    still_broken = _FakeSession([second])
+    conn.session = failing  # type: ignore[assignment]
+    conn._connected = True
+
+    reconnects: list[int] = []
+    _install_fake_lifecycle(
+        monkeypatch, conn, [still_broken], reconnect_counter=reconnects
+    )
+
+    result = await conn.call_tool("odoo_search", {})
+    # Caller sees the ORIGINAL result, not the retry one.
+    assert result is first
+    assert len(reconnects) == 1
+    # Both sessions saw exactly one call.
+    assert len(failing.calls) == 1
+    assert len(still_broken.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# (g) CallToolResult(isError=True, non-transient text) → returned as-is
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_does_not_retry_is_error_with_non_transient_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _make_conn()
+    non_transient = _make_tool_result(True, "Invalid partner ID")
+    failing = _FakeSession([non_transient])
+    conn.session = failing  # type: ignore[assignment]
+    conn._connected = True
+
+    reconnects: list[int] = []
+    # No replacement session: if reconnect is (wrongly) invoked, fake_connect
+    # will blow up with AssertionError.
+    _install_fake_lifecycle(monkeypatch, conn, [], reconnect_counter=reconnects)
+
+    result = await conn.call_tool("odoo_search", {})
+    assert result is non_transient
+    assert reconnects == []
+    assert len(failing.calls) == 1
