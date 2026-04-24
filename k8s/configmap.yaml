@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lumina-mcp-router-config
+  namespace: mcp-server
+data:
+  backends.yaml: |
+    backends:
+      - name: gsuite
+        url: http://mcp-gsuite.mcp-server.svc.cluster.local:30203/sse
+      - name: microsoft
+        url: http://mcp-microsoft.mcp-server.svc.cluster.local:30201/sse
+      - name: odoo
+        url: http://mcp-odoo.mcp-server.svc.cluster.local:30202/sse
+      - name: hass
+        url: http://mcp-hass.mcp-server.svc.cluster.local:30205/sse

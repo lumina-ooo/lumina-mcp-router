@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lumina-mcp-router
+  namespace: mcp-server
+  labels:
+    app: lumina-mcp-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lumina-mcp-router
+  template:
+    metadata:
+      labels:
+        app: lumina-mcp-router
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: router
+          image: ghcr.io/lumina-ooo/lumina-mcp-router:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MCP_BACKENDS_CONFIG
+              value: /etc/lumina-mcp-router/backends.yaml
+            - name: OLLAMA_BASE_URL
+              value: http://ollama.ai.svc.cluster.local:11434
+            - name: EMBEDDING_MODEL
+              value: nomic-embed-text
+            - name: LOG_LEVEL
+              value: INFO
+            - name: LISTEN_PORT
+              value: "8080"
+            - name: REINDEX_ENDPOINT_ENABLED
+              value: "true"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/lumina-mcp-router
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: lumina-mcp-router-config
