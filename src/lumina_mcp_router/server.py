@@ -16,10 +16,11 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.routing import Mount, Route
 
-from .backends import BackendRegistry
+from .backends import BackendConnection, BackendRegistry
 from .config import Config, load_config
 from .embedder import Embedder
 from .index import VectorIndex
+from .tool_cache import ToolCache
 from .tools import (
     CALL_TOOL_DESCRIPTION,
     CALL_TOOL_SCHEMA,
@@ -127,17 +128,30 @@ def build_app(cfg: Config, router: Router, mcp_server: Server) -> Starlette:
     @admin.get("/health")
     async def health() -> dict[str, Any]:
         backends = []
+        connected_count = 0
         for name in router.registry.names():
             conn = router.registry.get(name)
+            is_conn = bool(conn and conn.is_connected)
+            if is_conn:
+                connected_count += 1
             backends.append(
                 {
                     "name": name,
-                    "connected": bool(conn and conn.is_connected),
+                    "connected": is_conn,
+                    "cached_tools": len(router.cache.get(name)),
                 }
             )
         return {
             "status": "ok",
+            # Catalogue size — may be served from the persistent cache even
+            # while a backend is mid-reconnect. Always reflects what
+            # ``search_tools`` will return.
             "tools_indexed": len(router.index),
+            # Live transport state — distinct from the cached catalogue so
+            # operators can tell "stale catalogue but no live backend" from
+            # "fully healthy".
+            "backends_connected": connected_count,
+            "backends_total": len(router.registry.names()),
             "backends": backends,
         }
 
@@ -167,6 +181,35 @@ def build_app(cfg: Config, router: Router, mcp_server: Server) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette):  # noqa: D401
         logger.info("starting_lumina_mcp_router")
+        # Eagerly load the persistent tool catalogue cache BEFORE attempting
+        # any backend connection so /health and search_tools are immediately
+        # populated even if the backends are slow / down at startup.
+        try:
+            loaded = router.cache.load()
+            hydrated = router.hydrate_index_from_cache()
+            logger.info(
+                "tool_cache_hydrated",
+                extra={"loaded": loaded, "hydrated": hydrated},
+            )
+        except Exception as e:  # pragma: no cover - cache must never break startup
+            logger.exception("tool_cache_hydrate_failed: %s", e)
+
+        # Register the per-backend post-connect refresh hook so each
+        # event-driven reconnect (and the initial connect) refreshes the
+        # cache + embedding index for that backend.
+        async def _on_backend_connected(conn: BackendConnection) -> None:
+            try:
+                await router.refresh_backend(conn)
+            except Exception as e:  # pragma: no cover - refresh must not crash
+                logger.exception(
+                    "on_backend_connected_refresh_failed: %s", e
+                )
+
+        for bname in router.registry.names():
+            bc = router.registry.get(bname)
+            if bc is not None:
+                bc.set_on_connected(_on_backend_connected)
+
         status = await router.registry.connect_all()
         logger.info("backends_status", extra={"status": status})
         try:
@@ -196,7 +239,10 @@ def create_app(cfg: Config | None = None) -> Starlette:
     setup_logging(cfg.log_level)
     registry = BackendRegistry(cfg.backends)
     embedder = Embedder(base_url=cfg.ollama_base_url, model=cfg.embedding_model)
-    router = Router(registry=registry, embedder=embedder, index=VectorIndex())
+    cache = ToolCache()
+    router = Router(
+        registry=registry, embedder=embedder, index=VectorIndex(), cache=cache
+    )
     mcp_server = build_mcp_server(router)
     return build_app(cfg, router, mcp_server)
 

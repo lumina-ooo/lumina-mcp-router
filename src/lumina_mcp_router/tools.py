@@ -7,9 +7,10 @@ from typing import Any
 
 import numpy as np
 
-from .backends import BackendRegistry
+from .backends import BackendConnection, BackendRegistry
 from .embedder import Embedder
 from .index import ToolEntry, VectorIndex
+from .tool_cache import CachedTool, ToolCache
 
 logger = logging.getLogger(__name__)
 
@@ -132,53 +133,162 @@ class Router:
         registry: BackendRegistry,
         embedder: Embedder,
         index: VectorIndex | None = None,
+        cache: ToolCache | None = None,
     ) -> None:
         self.registry = registry
         self.embedder = embedder
-        self.index = index or VectorIndex()
+        self.index = index if index is not None else VectorIndex()
+        self.cache = cache if cache is not None else ToolCache()
+
+    def hydrate_index_from_cache(self) -> int:
+        """Populate the embedding index from the persistent cache.
+
+        Called once at router startup BEFORE any backend has finished
+        connecting so ``search_tools`` is immediately functional. Returns
+        the number of entries inserted.
+        """
+        count = 0
+        for cached in self.cache.all():
+            if not cached.embedding:
+                continue
+            qname = qualified_name(cached.backend, cached.name)
+            self.index.add(
+                ToolEntry(
+                    name=qname,
+                    backend=cached.backend,
+                    original_name=cached.name,
+                    description=cached.description,
+                    input_schema=cached.input_schema,
+                    embedding=np.asarray(cached.embedding, dtype=np.float32),
+                )
+            )
+            count += 1
+        if count:
+            logger.info(
+                "tool_index_hydrated_from_cache",
+                extra={"tools": count, "backends": len(self.cache.backends())},
+            )
+        return count
+
+    async def refresh_backend(self, conn: BackendConnection) -> int:
+        """Re-list, re-embed, and re-index a single backend's tools.
+
+        Updates both the embedding index AND the persistent cache so that
+        future restarts (and the in-flight reconnect window for THIS
+        backend) keep serving stale-but-correct results to ``search_tools``.
+
+        Returns the number of tools indexed for the backend (0 on error).
+        Errors are logged but never raised — a misbehaving backend must
+        not break the router's connect path.
+        """
+        if conn.session is None:
+            return 0
+        try:
+            tools = await conn.list_tools()
+        except BaseException as e:  # noqa: BLE001
+            logger.warning(
+                "refresh_backend_list_failed",
+                extra={
+                    "backend": conn.name,
+                    "error": str(e) or type(e).__name__,
+                },
+            )
+            return 0
+
+        cfg = getattr(conn, "cfg", None)
+        ctx = getattr(cfg, "embedding_context", None) if cfg is not None else None
+        # Drop the backend's existing index entries before re-adding so
+        # removed tools disappear immediately.
+        for entry in list(self.index.all()):
+            if entry.backend == conn.name:
+                self.index.remove(entry.name)
+
+        cached_entries: list[CachedTool] = []
+        count = 0
+        for t in tools:
+            text = build_indexed_text(t.backend, t.name, t.description, ctx)
+            try:
+                vec = await self.embedder.embed(text)
+            except BaseException as e:  # noqa: BLE001
+                logger.warning(
+                    "refresh_backend_embed_failed",
+                    extra={
+                        "backend": t.backend,
+                        "tool": t.name,
+                        "error": str(e) or type(e).__name__,
+                    },
+                )
+                continue
+            qname = qualified_name(t.backend, t.name)
+            self.index.add(
+                ToolEntry(
+                    name=qname,
+                    backend=t.backend,
+                    original_name=t.name,
+                    description=t.description,
+                    input_schema=t.input_schema,
+                    embedding=np.asarray(vec, dtype=np.float32),
+                )
+            )
+            cached_entries.append(
+                CachedTool(
+                    backend=t.backend,
+                    name=t.name,
+                    description=t.description,
+                    input_schema=t.input_schema,
+                    embedding=list(vec),
+                )
+            )
+            count += 1
+
+        self.cache.replace_backend(conn.name, cached_entries)
+        logger.info(
+            "refresh_backend_complete",
+            extra={"backend": conn.name, "tools": count},
+        )
+        return count
 
     async def reindex(self) -> dict[str, Any]:
-        """Reconnect any dead backends, re-list tools, re-embed everything."""
+        """Reconnect any dead backends, re-list tools, re-embed everything.
+
+        Each backend's tool list is refreshed via :meth:`refresh_backend`,
+        which also updates the persistent cache. Entries for connected
+        backends are atomically replaced; entries for backends that fail
+        to list tools are LEFT IN THE CACHE so ``search_tools`` keeps
+        working through transient outages.
+        """
         stats: dict[str, Any] = {"backends": {}, "total_tools": 0}
-        self.index.clear()
 
         # Ensure connections (best effort)
         await self.registry.connect_all()
 
+        live_backends: set[str] = set()
         for name in self.registry.names():
             conn = self.registry.get(name)
+            live_backends.add(name)
             if conn is None or conn.session is None:
-                stats["backends"][name] = {"status": "down", "tools": 0}
+                # Keep cached entries (if any) for this backend in the
+                # index so search_tools still returns useful results.
+                cached = self.cache.get(name)
+                stats["backends"][name] = {
+                    "status": "down",
+                    "tools": len(cached),
+                    "from_cache": True,
+                }
+                stats["total_tools"] += len(cached)
                 continue
-            try:
-                tools = await conn.list_tools()
-            except Exception as e:
-                logger.warning("list_tools_failed: %s (%s)", name, e)
-                stats["backends"][name] = {"status": "error", "error": str(e), "tools": 0}
-                continue
-            count = 0
-            ctx = getattr(conn.cfg, "embedding_context", None) if hasattr(conn, "cfg") else None
-            for t in tools:
-                text = build_indexed_text(t.backend, t.name, t.description, ctx)
-                try:
-                    vec = await self.embedder.embed(text)
-                except Exception as e:
-                    logger.warning("embed_failed for %s/%s: %s", t.backend, t.name, e)
-                    continue
-                qname = qualified_name(t.backend, t.name)
-                self.index.add(
-                    ToolEntry(
-                        name=qname,
-                        backend=t.backend,
-                        original_name=t.name,
-                        description=t.description,
-                        input_schema=t.input_schema,
-                        embedding=np.asarray(vec, dtype=np.float32),
-                    )
-                )
-                count += 1
+            count = await self.refresh_backend(conn)
             stats["backends"][name] = {"status": "ok", "tools": count}
             stats["total_tools"] += count
+
+        # Drop cache + index entries for backends no longer configured.
+        for cached_backend in list(self.cache.backends()):
+            if cached_backend not in live_backends:
+                for entry in list(self.index.all()):
+                    if entry.backend == cached_backend:
+                        self.index.remove(entry.name)
+                self.cache.remove_backend(cached_backend)
+
         logger.info("reindex_complete", extra={"stats": stats})
         return stats
 
@@ -203,10 +313,16 @@ class Router:
                 f"Unknown tool '{name}'. Call search_tools first to discover available tools."
             )
         conn = self.registry.get(entry.backend)
-        if conn is None or conn.session is None:
+        if conn is None:
             raise RuntimeError(
-                f"Backend '{entry.backend}' is not currently available. Try again later."
+                f"Backend '{entry.backend}' is not configured."
             )
+        # NOTE: we do NOT short-circuit when ``conn.session is None``.
+        # ``BackendConnection.call_tool`` will trigger a reconnect via the
+        # existing transient-error retry path; if the backend really can't
+        # come back the resulting error surfaces to the caller. This is
+        # intentional: the persistent tool cache means an entry may exist
+        # in the index even while the backend is between sessions.
         result = await conn.call_tool(entry.original_name, arguments or {})
         return _serialize_mcp_result(result)
 
