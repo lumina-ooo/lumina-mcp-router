@@ -50,6 +50,10 @@ class VectorIndex:
     def add(self, entry: ToolEntry) -> None:
         self._entries[entry.name] = entry
 
+    def remove(self, name: str) -> bool:
+        """Remove an entry by globally-unique name; return True if removed."""
+        return self._entries.pop(name, None) is not None
+
     def __contains__(self, name: str) -> bool:
         return name in self._entries
 

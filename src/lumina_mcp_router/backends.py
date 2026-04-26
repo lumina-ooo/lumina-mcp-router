@@ -12,8 +12,9 @@ import asyncio
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
+import anyio
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -158,6 +159,18 @@ class BackendConnection:
         # callers capture it before acquiring the lock; if it changed while
         # they waited, another task already reconnected and they can skip.
         self._reconnect_generation: int = 0
+        # Optional async callback invoked after each successful (re)connect
+        # with ``self`` as the only argument. Used by the registry / router
+        # to refresh the persistent tool catalogue cache + embedding index.
+        # Set via :meth:`set_on_connected`.
+        self._on_connected: Callable[["BackendConnection"], Awaitable[None]] | None = None
+        # Background task that watches the underlying transport for close /
+        # error events and schedules an event-driven reconnect. Tracked so we
+        # can cancel it during shutdown.
+        self._watch_task: asyncio.Task[None] | None = None
+        # Background reconnect tasks spawned by the close-event watcher;
+        # tracked so shutdown can cancel them cleanly.
+        self._auto_reconnect_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def name(self) -> str:
@@ -166,6 +179,72 @@ class BackendConnection:
     @property
     def is_connected(self) -> bool:
         return self._connected and self.session is not None
+
+    def set_on_connected(
+        self,
+        cb: Callable[["BackendConnection"], Awaitable[None]] | None,
+    ) -> None:
+        """Register an async callback fired after each successful (re)connect.
+
+        The callback receives ``self`` and is awaited inside :meth:`connect`
+        right after the backend is marked ready. It is the hook the router
+        uses to refresh the persistent tool catalogue cache and the
+        embedding index for this backend. Exceptions are logged but never
+        propagated, so a misbehaving cache cannot break connectivity.
+        """
+        self._on_connected = cb
+
+    def _schedule_auto_reconnect(self, reason: str) -> None:
+        """Spawn a background task that runs :meth:`_reconnect_locked`.
+
+        Triggered by the transport-close watcher inside ``_runner`` so we
+        don't block the runner's own shutdown. The task uses the existing
+        per-backend reconnect lock + generation counter so it composes with
+        the on-call-error reconnect path without introducing new locking
+        primitives.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop, can't schedule
+            logger.error(
+                "backend_auto_reconnect_no_loop",
+                extra={"backend": self.cfg.name, "reason": reason},
+            )
+            return
+
+        observed = self._reconnect_generation
+
+        async def _do() -> None:
+            try:
+                logger.warning(
+                    "backend_transport_closed_scheduling_reconnect",
+                    extra={
+                        "backend": self.cfg.name,
+                        "transport": self.cfg.transport,
+                        "reason": reason,
+                    },
+                )
+                await self._reconnect_locked(
+                    reason=reason, observed_generation=observed
+                )
+            except BaseException as e:  # noqa: BLE001
+                logger.error(
+                    "backend_auto_reconnect_failed",
+                    extra={
+                        "backend": self.cfg.name,
+                        "transport": self.cfg.transport,
+                        "reason": reason,
+                        "error": str(e) or type(e).__name__,
+                    },
+                )
+                # Leave backend marked disconnected — next tool-call retry
+                # path will re-attempt (existing behaviour preserved).
+
+        task = loop.create_task(
+            _do(), name=f"lumina-backend-{self.cfg.name}-auto-reconnect"
+        )
+        self._auto_reconnect_tasks.add(task)
+        task.add_done_callback(self._auto_reconnect_tasks.discard)
 
     async def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
         """Start the backend task and wait until it's initialised.
@@ -180,23 +259,98 @@ class BackendConnection:
         self._error = None
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()
+        # Set when the underlying transport's read stream is observed to
+        # close or error out — the runner uses this to exit and the event
+        # also triggers the on-disconnect reconnect path.
+        transport_closed = asyncio.Event()
 
         ready = self._ready
         stop = self._stop
+        loop = asyncio.get_running_loop()
 
         async def _runner() -> None:
             stack = AsyncExitStack()
             try:
-                read, write = await stack.enter_async_context(
+                upstream_read, write = await stack.enter_async_context(
                     _open_transport(self.cfg.transport, self.cfg.url)
                 )
-                session = await stack.enter_async_context(ClientSession(read, write))
+                # Wrap the upstream read stream with an in-process anyio
+                # memory stream pair. A forwarder coroutine pumps messages
+                # from upstream → wrapper; when the upstream stream closes
+                # (EOF, ClosedResourceError, network error, server EOF) we
+                # set ``transport_closed`` so the supervisor can fire the
+                # reactive reconnect path. This is the EVENT-DRIVEN hook
+                # required by the design — no polling, no heartbeats.
+                wrapper_send, wrapper_recv = anyio.create_memory_object_stream(
+                    max_buffer_size=0
+                )
+
+                async def _forward_read() -> None:
+                    try:
+                        async for msg in upstream_read:
+                            try:
+                                await wrapper_send.send(msg)
+                            except anyio.BrokenResourceError:
+                                # Consumer (ClientSession) went away first.
+                                break
+                    except BaseException as e:  # noqa: BLE001
+                        logger.info(
+                            "backend_transport_read_ended",
+                            extra={
+                                "backend": self.cfg.name,
+                                "transport": self.cfg.transport,
+                                "error": str(e) or type(e).__name__,
+                            },
+                        )
+                    finally:
+                        try:
+                            await wrapper_send.aclose()
+                        except BaseException:  # pragma: no cover - best effort
+                            pass
+                        # Schedule the close-event signal on the connect()
+                        # caller's loop (this forwarder may already be on
+                        # the same loop, but being explicit is safe).
+                        loop.call_soon_threadsafe(transport_closed.set)
+
+                forwarder = asyncio.create_task(
+                    _forward_read(),
+                    name=f"lumina-backend-{self.cfg.name}-read-forward",
+                )
+
+                session = await stack.enter_async_context(
+                    ClientSession(wrapper_recv, write)
+                )
                 await session.initialize()
                 self.session = session
                 self._connected = True
                 ready.set()
-                # Keep the transport + session alive until close() is called.
-                await stop.wait()
+                # Keep the transport + session alive until close() is called
+                # OR the transport's read side signals it has gone away.
+                stop_task = asyncio.create_task(stop.wait())
+                closed_task = asyncio.create_task(transport_closed.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {stop_task, closed_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for t in (stop_task, closed_task):
+                        if not t.done():
+                            t.cancel()
+                    forwarder.cancel()
+                    try:
+                        await forwarder
+                    except BaseException:  # pragma: no cover
+                        pass
+                if transport_closed.is_set() and not stop.is_set():
+                    # Transport died beneath us — schedule a reactive
+                    # reconnect. We do NOT call _reconnect_locked from
+                    # inside _runner (that would deadlock on close()
+                    # awaiting this same task); instead spawn a dedicated
+                    # task that will run after _runner finishes.
+                    self._schedule_auto_reconnect(
+                        reason="transport closed (event-driven)",
+                    )
             except BaseException as e:  # noqa: BLE001 - propagated via self._error
                 self._error = e
                 # Make sure connect() wakes up even if we failed before ready.
@@ -246,7 +400,33 @@ class BackendConnection:
             },
         )
 
+        # Fire the post-connect callback (cache refresh + reindex). Failures
+        # here are logged but do not fail the connect — a bad cache must
+        # never take the router down.
+        if self._on_connected is not None:
+            try:
+                await self._on_connected(self)
+            except BaseException as e:  # noqa: BLE001
+                logger.error(
+                    "backend_on_connected_failed",
+                    extra={
+                        "backend": self.cfg.name,
+                        "error": str(e) or type(e).__name__,
+                    },
+                )
+
     async def close(self, timeout: float = DEFAULT_CLOSE_TIMEOUT) -> None:
+        # Cancel any in-flight transport-close-triggered reconnect attempts
+        # (other than the one possibly calling us via _reconnect_locked).
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:  # pragma: no cover
+            current = None
+        for t in list(self._auto_reconnect_tasks):
+            if t is current:
+                continue
+            if not t.done():
+                t.cancel()
         if self._task is None:
             self._connected = False
             self.session = None
